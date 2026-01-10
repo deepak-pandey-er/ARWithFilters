@@ -23,6 +23,9 @@ from pipeline.ground_lock import GroundAligner
 from pipeline.kalman import PoseKalman
 from pipeline.ar_output import AROutput
 
+# New import for BA autocalib
+from pipeline.ba_autocalib import run_markerless_from_frames, default_initial_K  # noqa: F401
+
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -38,10 +41,12 @@ class MainWindow(QtWidgets.QWidget):
         self.loadVideoBtn = QtWidgets.QPushButton("Load Video")
         self.loadIntrBtn = QtWidgets.QPushButton("Load Intrinsics (JSON)")
         self.loadIMUBtn = QtWidgets.QPushButton("Load IMU CSV (optional)")
+        self.calibBtn = QtWidgets.QPushButton("Run Markerless Calibration")  # NEW
         self.runBtn = QtWidgets.QPushButton("Run")
         topbar.addWidget(self.loadVideoBtn)
         topbar.addWidget(self.loadIntrBtn)
         topbar.addWidget(self.loadIMUBtn)
+        topbar.addWidget(self.calibBtn)  # NEW
         topbar.addWidget(self.runBtn)
         layout.addLayout(topbar)
 
@@ -62,6 +67,7 @@ class MainWindow(QtWidgets.QWidget):
         self.loadVideoBtn.clicked.connect(self.load_video)
         self.loadIntrBtn.clicked.connect(self.load_intrinsics)
         self.loadIMUBtn.clicked.connect(self.load_imu)
+        self.calibBtn.clicked.connect(self.run_markerless_calib)  # NEW handler
         self.runBtn.clicked.connect(self.run_pipeline)
 
     def log_msg(self, s):
@@ -87,6 +93,94 @@ class MainWindow(QtWidgets.QWidget):
         if path:
             self.imuPath = path
             self.log_msg(f"Loaded IMU CSV: {path}")
+
+    def run_markerless_calib(self):
+        """
+        Entrypoint for the UI button. Samples frames and runs markerless BA-based calibration.
+        Sampling strategy:
+            - If a video is loaded: sample `n_frames` evenly spaced frames from the video.
+            - Else: open webcam and let user press SPACE to capture frames interactively.
+        """
+        # ask for number of frames
+        n_frames, ok = QtWidgets.QInputDialog.getInt(self, "Frames", "Number of frames to capture (>=3):", 8, 3, 50, 1)
+        if not ok:
+            return
+
+        frames = []
+        if self.videoPath:
+            # sample evenly
+            cap = cv2.VideoCapture(self.videoPath)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total < n_frames:
+                self.log_msg(f"Video has only {total} frames; reducing requested frames.")
+                n_frames = max(3, total)
+            indices = np.linspace(0, max(0, total - 1), n_frames, dtype=int)
+            self.log_msg(f"Sampling {n_frames} frames from video at indices: {indices.tolist()}")
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(frame.copy())
+            cap.release()
+        else:
+            # open webcam capture
+            cam_id, okc = QtWidgets.QInputDialog.getInt(self, "Camera", "Camera index:", 0, 0, 10, 1)
+            if not okc:
+                return
+            cap = cv2.VideoCapture(cam_id)
+            if not cap.isOpened():
+                QtWidgets.QMessageBox.critical(self, "Camera Error", f"Cannot open camera {cam_id}")
+                return
+            self.log_msg("Press SPACE to capture a frame, ESC to cancel.")
+            while len(frames) < n_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                disp = frame.copy()
+                cv2.putText(disp, f"Frame {len(frames)}/{n_frames}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.imshow("Capture (press SPACE)", disp)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    self.log_msg("ESC pressed. Stopping capture.")
+                    break
+                if key == 32:
+                    frames.append(frame.copy())
+                    self.log_msg(f"Captured frame {len(frames)}/{n_frames}")
+            cap.release()
+            cv2.destroyAllWindows()
+
+        if len(frames) < 3:
+            QtWidgets.QMessageBox.warning(self, "Not enough frames", "Captured fewer than 3 frames. Aborting calibration.")
+            return
+
+        # run calibration (this may take time)
+        self.log_msg("Running markerless bundle-adjustment autocalibration (this may take a while)...")
+        try:
+            # initial K guess from frame size
+            h, w = frames[0].shape[:2]
+            K0 = default_initial_K((h, w))
+            K_opt, poses_opt, pts_opt, res = run_markerless_from_frames(frames, initial_K=K0, fxfy_equal=True, verbose=2)
+        except Exception as e:
+            self.log_msg(f"Calibration failed: {e}")
+            QtWidgets.QMessageBox.critical(self, "Calibration Failed",
+                                           "Markerless calibration failed. Try capturing frames with more parallax and texture, or use a checkerboard/marker fallback.")
+            return
+
+        # Save intrinsics to JSON and update internal state
+        out = {
+            "camera_matrix": {
+                "rows": 3,
+                "cols": 3,
+                "data": K_opt.reshape(-1).tolist()
+            }
+        }
+        out_path = "intrinsics_calibrated.json"
+        with open(out_path, "w") as f:
+            json.dump(out, f, indent=2)
+        self.intrinsics = out  # update in-memory intrinsics used by pipeline
+        self.log_msg(f"Calibration successful. Saved intrinsics to {out_path}")
 
     def run_pipeline(self):
         if not self.videoPath:
@@ -143,12 +237,14 @@ class MainWindow(QtWidgets.QWidget):
         cap.release()
         self.log_msg("Processing finished. Outputs saved to output/")
 
+
 def torch_is_available():
     try:
         import torch
         return torch.cuda.is_available()
     except Exception:
         return False
+
 
 def torch_installed_on_path():
     # Check existence of torch package without importing it (avoids triggering DLL load)
