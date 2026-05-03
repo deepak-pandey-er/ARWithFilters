@@ -1,13 +1,16 @@
+﻿"""Tkinter UI and pipeline orchestrator.
+Simple UI: load video, intrinsics JSON, imu CSV (optional), start processing.
 """
-PyQt5 UI and pipeline orchestrator with STYPE UDP broadcast support and async calibration.
-"""
+
 import sys
 import json
 import time
 import importlib.util
+import base64
 from pathlib import Path
 
-from PyQt5 import QtWidgets, QtGui, QtCore
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
 import cv2
 import numpy as np
 
@@ -20,9 +23,7 @@ from pipeline.ground_lock import GroundAligner
 from pipeline.kalman import PoseKalman
 from pipeline.ar_output import AROutput
 
-# BA autocalib
 from pipeline.ba_autocalib import run_markerless_from_frames, default_initial_K
-# STYPE UDP broadcaster
 from pipeline.udp_stype import send_camera_stype, BackgroundSender
 
 OUTPUT_DIR = Path("output")
@@ -34,16 +35,23 @@ DEFAULT_SETTINGS = {
     "udp_port": 5555
 }
 
+BG_COLOR = "#121212"
+FG_COLOR = "#F5F5F5"
+SIDEBAR_BG = "#1B1D23"
+PANEL_BG = "#181A20"
+ENTRY_BG = "#252731"
+BUTTON_BG = "#2F313B"
+BUTTON_ACTIVE = "#3C3F4B"
+LOG_BG = "#101214"
+VIDEO_BORDER = "#2C3040"
+HIGHLIGHT = "#5E9BF6"
+
+BUTTON_FONT = ("Segoe UI", 9)
+TITLE_FONT = ("Segoe UI", 13, "bold")
+SECTION_FONT = ("Segoe UI", 11, "bold")
+
 
 def normalize_intrinsics(intrinsics):
-    """Normalize supported intrinsics JSON formats to a canonical dict.
-
-    Supported input formats:
-      - {"fx", "fy", "cx", "cy", ...}
-      - {"camera_matrix": {"rows": 3, "cols": 3, "data": [..]}}
-      - {"camera_matrix": [[..],[..],[..]]}
-      - {"camera_matrix": [9 values]}
-    """
     if intrinsics is None:
         return None
 
@@ -55,14 +63,15 @@ def normalize_intrinsics(intrinsics):
             if data is None:
                 data = cm.get("matrix")
             if data is None and cm.get("rows") == 3 and cm.get("cols") == 3:
-                # Support OpenCV-style nested camera_matrix dict
                 data = cm.get("data")
         else:
             data = cm
 
         if isinstance(data, (list, tuple)) and len(data) == 9:
             return np.array(data, dtype=float).reshape((3, 3))
-        if isinstance(data, (list, tuple)) and len(data) == 3 and all(isinstance(row, (list, tuple)) and len(row) == 3 for row in data):
+        if isinstance(data, (list, tuple)) and len(data) == 3 and all(
+            isinstance(row, (list, tuple)) and len(row) == 3 for row in data
+        ):
             return np.array(data, dtype=float)
         return None
 
@@ -80,97 +89,234 @@ def normalize_intrinsics(intrinsics):
     raise ValueError("Unsupported intrinsics JSON format: expected fx/fy/cx/cy or camera_matrix data.")
 
 
-class MainWindow(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Cricket AR Tracker")
-        self.setGeometry(50, 50, 1200, 900)
+class MainWindow:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Cricket AR Tracker")
+        self.root.configure(bg=BG_COLOR)
+        self.root.geometry("1280x860")
+        self.root.minsize(1100, 700)
 
-        layout = QtWidgets.QVBoxLayout(self)
-
-        topbar = QtWidgets.QHBoxLayout()
-        self.loadVideoBtn = QtWidgets.QPushButton("Load Video")
-        self.loadIntrBtn = QtWidgets.QPushButton("Load Intrinsics (JSON)")
-        self.loadIMUBtn = QtWidgets.QPushButton("Load IMU CSV (optional)")
-        self.calibBtn = QtWidgets.QPushButton("Run Markerless Calibration")
-        self.runBtn = QtWidgets.QPushButton("Run")
-        topbar.addWidget(self.loadVideoBtn)
-        topbar.addWidget(self.loadIntrBtn)
-        topbar.addWidget(self.loadIMUBtn)
-        topbar.addWidget(self.calibBtn)
-        topbar.addWidget(self.runBtn)
-
-        # UDP broadcast controls
-        self.ipEdit = QtWidgets.QLineEdit("127.0.0.1")
-        self.portEdit = QtWidgets.QLineEdit("5005")
-        self.broadcastCheck = QtWidgets.QCheckBox("Enable UDP Broadcast (STYPE)")
-        self.continuousCheck = QtWidgets.QCheckBox("Continuous")
-        self.rateSpin = QtWidgets.QSpinBox()
-        self.rateSpin.setRange(1, 100)
-        self.rateSpin.setValue(10)
-        topbar.addWidget(QtWidgets.QLabel("IP:"))
-        topbar.addWidget(self.ipEdit)
-        topbar.addWidget(QtWidgets.QLabel("Port:"))
-        topbar.addWidget(self.portEdit)
-        topbar.addWidget(self.broadcastCheck)
-        topbar.addWidget(self.continuousCheck)
-        topbar.addWidget(QtWidgets.QLabel("Hz:"))
-        topbar.addWidget(self.rateSpin)
-
-        layout.addLayout(topbar)
-
-        self.videoLabel = QtWidgets.QLabel()
-        self.videoLabel.setFixedSize(960, 540)
-        layout.addWidget(self.videoLabel)
-
-        self.log = QtWidgets.QTextEdit()
-        self.log.setReadOnly(True)
-        layout.addWidget(self.log)
-
-        # state
         self.videoPath = None
         self.intrinsics = None
         self.imuPath = None
+        self.udp_ip = DEFAULT_SETTINGS["udp_ip"]
+        self.udp_port = DEFAULT_SETTINGS["udp_port"]
         self.packet_no = 0
         self._bg_sender = None
+        self.photo = None
+        self.log_overlay_visible = False
+        self.sidebar_visible = True
 
-        # thread handles
-        self._calib_thread = None
-        self._calib_worker = None
-        self._progress_dialog = None
-
-        # connect
-        self.loadVideoBtn.clicked.connect(self.load_video)
-        self.loadIntrBtn.clicked.connect(self.load_intrinsics)
-        self.loadIMUBtn.clicked.connect(self.load_imu)
-        self.calibBtn.clicked.connect(self.run_markerless_calib)
-        self.runBtn.clicked.connect(self.run_pipeline)
-
-        self.udpIpEdit = QtWidgets.QLineEdit()
-        self.udpIpEdit.setFixedWidth(140)
-        self.udpPortEdit = QtWidgets.QLineEdit()
-        self.udpPortEdit.setFixedWidth(80)
-        self.udpPortEdit.setValidator(QtGui.QIntValidator(1, 65535, self))
-
-        udp_layout = QtWidgets.QHBoxLayout()
-        udp_layout.addWidget(QtWidgets.QLabel("UDP IP:"))
-        udp_layout.addWidget(self.udpIpEdit)
-        udp_layout.addWidget(QtWidgets.QLabel("Port:"))
-        udp_layout.addWidget(self.udpPortEdit)
-        self.saveUdpBtn = QtWidgets.QPushButton("Save UDP Settings")
-        udp_layout.addWidget(self.saveUdpBtn)
-        layout.addLayout(udp_layout)
-
-        self.saveUdpBtn.clicked.connect(self.save_settings)
+        self._build_ui()
         self.load_settings()
 
-    def log_msg(self, s):
+    def _build_ui(self):
+        title_frame = tk.Frame(self.root, bg=PANEL_BG, height=42)
+        title_frame.pack(fill="x")
+        tk.Label(
+            title_frame,
+            text="AR Tracker",
+            bg=PANEL_BG,
+            fg=FG_COLOR,
+            font=TITLE_FONT,
+            padx=16,
+            pady=10,
+        ).pack(side="left")
+
+        self.toggle_panel_btn = tk.Button(
+            title_frame,
+            text="Hide Panel",
+            command=self.toggle_sidebar,
+            bg=BUTTON_BG,
+            fg=FG_COLOR,
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=FG_COLOR,
+            relief="flat",
+            padx=10,
+            pady=8,
+            font=BUTTON_FONT,
+        )
+        self.toggle_panel_btn.pack(side="right", padx=10, pady=4)
+
+        content_frame = tk.Frame(self.root, bg=BG_COLOR)
+        content_frame.pack(fill="both", expand=True, padx=10, pady=(10, 10))
+
+        self.video_container = tk.Frame(content_frame, bg=VIDEO_BORDER, bd=1, relief="flat")
+        self.video_container.pack(side="left", fill="both", expand=True)
+
+        self.video_label = tk.Label(self.video_container, bg="#000000")
+        self.video_label.pack(fill="both", expand=True)
+
+        sidebar = tk.Frame(self.video_container, bg=SIDEBAR_BG, width=300)
+        sidebar.place(relx=1.0, rely=0.02, anchor="ne", width=320, relheight=0.92)
+        self.sidebar = sidebar
+        sidebar.lift(aboveThis=self.video_label)
+
+        self.log_overlay_frame = tk.Frame(self.video_container, bg=LOG_BG, bd=1, relief="solid")
+        self.log_overlay_text = tk.Text(
+            self.log_overlay_frame,
+            bg=LOG_BG,
+            fg=FG_COLOR,
+            insertbackground=FG_COLOR,
+            height=10,
+            wrap="word",
+            relief="flat",
+        )
+        self.log_overlay_text.pack(fill="both", expand=True)
+        self.log_overlay_text.config(state="disabled")
+
+        button_frame = tk.Frame(sidebar, bg=SIDEBAR_BG, width=280)
+        button_frame.pack(fill="x", pady=(10, 6), padx=10)
+
+        self.load_video_btn = self._make_button(button_frame, "Load Video", self.load_video)
+        self.load_intr_btn = self._make_button(button_frame, "Load Intrinsics", self.load_intrinsics)
+        self.load_imu_btn = self._make_button(button_frame, "Load IMU CSV", self.load_imu)
+        self.calib_btn = self._make_button(button_frame, "Run Markerless Calibration", self.run_markerless_calib)
+        self.run_btn = self._make_button(button_frame, "Run", self.run_pipeline)
+
+        for btn in (
+            self.load_video_btn,
+            self.load_intr_btn,
+            self.load_imu_btn,
+            self.calib_btn,
+            self.run_btn,
+        ):
+            btn.pack(fill="x", pady=6)
+
+        ui_section = tk.Frame(sidebar, bg=SIDEBAR_BG)
+        ui_section.pack(fill="x", pady=(20, 8), padx=12)
+        tk.Label(ui_section, text="Video / UDP Settings", bg=SIDEBAR_BG, fg=FG_COLOR, font=SECTION_FONT).pack(anchor="w")
+
+        self.toggle_log_btn = self._make_button(ui_section, "Show Logs", self.toggle_log_overlay)
+        self.toggle_log_btn.pack(fill="x", pady=6)
+
+        entry_frame = tk.Frame(ui_section, bg=SIDEBAR_BG)
+        entry_frame.pack(fill="x", pady=4)
+        tk.Label(entry_frame, text="UDP IP", bg=SIDEBAR_BG, fg=FG_COLOR).pack(anchor="w")
+        self.udp_ip_var = tk.StringVar(value=self.udp_ip)
+        self.udp_ip_entry = self._make_entry(entry_frame, self.udp_ip_var, width=24)
+        self.udp_ip_entry.pack(fill="x", pady=(4, 10))
+
+        tk.Label(entry_frame, text="Port", bg=SIDEBAR_BG, fg=FG_COLOR).pack(anchor="w")
+        self.udp_port_var = tk.StringVar(value=str(self.udp_port))
+        self.udp_port_entry = self._make_entry(entry_frame, self.udp_port_var, width=24)
+        self.udp_port_entry.pack(fill="x", pady=(4, 10))
+
+        self.save_udp_btn = self._make_button(ui_section, "Save UDP Settings", self.save_settings)
+        self.save_udp_btn.pack(fill="x", pady=6)
+
+        self.broadcast_var = tk.BooleanVar(value=False)
+        self.continuous_var = tk.BooleanVar(value=False)
+        self.rate_var = tk.IntVar(value=10)
+
+        check_frame = tk.Frame(ui_section, bg=SIDEBAR_BG)
+        check_frame.pack(fill="x", pady=(8, 8))
+        tk.Checkbutton(
+            check_frame,
+            text="Enable UDP Broadcast",
+            variable=self.broadcast_var,
+            bg=SIDEBAR_BG,
+            fg=FG_COLOR,
+            selectcolor=SIDEBAR_BG,
+            activebackground=SIDEBAR_BG,
+            activeforeground=FG_COLOR,
+            bd=0,
+        ).pack(anchor="w")
+        tk.Checkbutton(
+            check_frame,
+            text="Continuous",
+            variable=self.continuous_var,
+            bg=SIDEBAR_BG,
+            fg=FG_COLOR,
+            selectcolor=SIDEBAR_BG,
+            activebackground=SIDEBAR_BG,
+            activeforeground=FG_COLOR,
+            bd=0,
+        ).pack(anchor="w", pady=(4, 0))
+
+        rate_frame = tk.Frame(ui_section, bg=SIDEBAR_BG)
+        rate_frame.pack(fill="x", pady=(10, 0))
+        tk.Label(rate_frame, text="Broadcast Rate", bg=SIDEBAR_BG, fg=FG_COLOR).pack(anchor="w")
+        self.rate_spin = tk.Spinbox(
+            rate_frame,
+            from_=1,
+            to=100,
+            textvariable=self.rate_var,
+            width=8,
+            bg=ENTRY_BG,
+            fg=FG_COLOR,
+            insertbackground=FG_COLOR,
+            relief="flat",
+            justify="center",
+        )
+        self.rate_spin.pack(pady=(4, 0))
+
+        self.status_label = tk.Label(sidebar, text="Ready", bg=SIDEBAR_BG, fg=FG_COLOR, anchor="w")
+        self.status_label.pack(fill="x", side="bottom", pady=14, padx=12)
+
+    def _make_button(self, parent, text, command):
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=BUTTON_BG,
+            fg=FG_COLOR,
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=FG_COLOR,
+            relief="flat",
+            padx=10,
+            pady=8,
+            font=BUTTON_FONT,
+        )
+
+    def _make_entry(self, parent, textvariable, width=20):
+        return tk.Entry(
+            parent,
+            textvariable=textvariable,
+            bg=ENTRY_BG,
+            fg=FG_COLOR,
+            insertbackground=FG_COLOR,
+            width=width,
+            relief="flat",
+        )
+
+
+    def log_msg(self, message):
         ts = time.strftime("%H:%M:%S")
-        self.log.append(f"[{ts}] {s}")
-        print(s)
+        line = f"[{ts}] {message}\n"
+        self.status_label.config(text=message)
+
+        self.log_overlay_text.config(state="normal")
+        self.log_overlay_text.insert("end", line)
+        self.log_overlay_text.see("end")
+        self.log_overlay_text.config(state="disabled")
+        print(message)
+
+    def toggle_log_overlay(self):
+        self.log_overlay_visible = not self.log_overlay_visible
+        if self.log_overlay_visible:
+            self.log_overlay_frame.place(relx=0.02, rely=0.02, relwidth=0.45, relheight=0.32)
+            self.toggle_log_btn.config(text="Hide Logs")
+        else:
+            self.log_overlay_frame.place_forget()
+            self.toggle_log_btn.config(text="Show Logs")
+
+    def toggle_sidebar(self):
+        self.sidebar_visible = not self.sidebar_visible
+        if self.sidebar_visible:
+            self.sidebar.place(relx=1.0, rely=0.02, anchor="ne", width=320, relheight=0.92)
+            self.sidebar.lift()
+            self.toggle_panel_btn.config(text="Hide Panel")
+        else:
+            self.sidebar.place_forget()
+            self.toggle_panel_btn.config(text="Show Panel")
 
     def load_video(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open video", ".", "Videos (*.mp4 *.avi *.mov)")
+        path = filedialog.askopenfilename(
+            title="Open video",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov"), ("All files", "*")],
+        )
         if path:
             self.videoPath = path
             self.log_msg(f"Loaded video: {path}")
@@ -186,19 +332,19 @@ class MainWindow(QtWidgets.QWidget):
                 self.udp_port = int(data.get("udp_port", self.udp_port))
             except Exception as e:
                 self.log_msg(f"Failed to load settings: {e}")
-        self.udpIpEdit.setText(str(self.udp_ip))
-        self.udpPortEdit.setText(str(self.udp_port))
+        self.udp_ip_var.set(self.udp_ip)
+        self.udp_port_var.set(str(self.udp_port))
         self.log_msg(f"Loaded UDP settings: {self.udp_ip}:{self.udp_port}")
 
     def save_settings(self):
-        ip = self.udpIpEdit.text().strip() or DEFAULT_SETTINGS["udp_ip"]
-        port_text = self.udpPortEdit.text().strip()
+        ip = self.udp_ip_var.get().strip() or DEFAULT_SETTINGS["udp_ip"]
+        port_text = self.udp_port_var.get().strip()
         try:
             port = int(port_text)
             if port < 1 or port > 65535:
                 raise ValueError("Port out of range")
         except Exception:
-            QtWidgets.QMessageBox.warning(self, "Invalid Port", "Port must be an integer between 1 and 65535.")
+            messagebox.showwarning("Invalid Port", "Port must be an integer between 1 and 65535.")
             return
         self.udp_ip = ip
         self.udp_port = port
@@ -208,46 +354,31 @@ class MainWindow(QtWidgets.QWidget):
                 json.dump(settings, f, indent=2)
             self.log_msg(f"Saved UDP settings: {self.udp_ip}:{self.udp_port}")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save Failed", f"Unable to save settings: {e}")
+            messagebox.showerror("Save Failed", f"Unable to save settings: {e}")
 
     def load_intrinsics(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open intrinsics JSON", ".", "JSON (*.json)")
+        path = filedialog.askopenfilename(
+            title="Open intrinsics JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*")],
+        )
         if path:
             with open(path, "r") as f:
                 raw = json.load(f)
             try:
                 self.intrinsics = normalize_intrinsics(raw)
             except ValueError as e:
-                QtWidgets.QMessageBox.critical(self, "Invalid Intrinsics", str(e))
+                messagebox.showerror("Invalid Intrinsics", str(e))
                 return
             self.log_msg(f"Loaded intrinsics: {path}")
 
     def load_imu(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open IMU CSV", ".", "CSV (*.csv)")
+        path = filedialog.askopenfilename(
+            title="Open IMU CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*")],
+        )
         if path:
             self.imuPath = path
             self.log_msg(f"Loaded IMU CSV: {path}")
-
-    def _show_calib_results(self, K_opt, pose0):
-        # Display intrinsics matrix and first camera pose (R, t) in a dialog
-        R0, t0 = pose0
-        rvec0, _ = cv2.Rodrigues(R0)
-        text = []
-        text.append("Optimized camera matrix (K):")
-        text.append(np.array2string(K_opt, precision=3, separator=', '))
-        text.append("")
-        text.append("First camera pose (R):")
-        text.append(np.array2string(R0, precision=3, separator=', '))
-        text.append("")
-        text.append("First camera translation (t) in meters:")
-        text.append(np.array2string(t0, precision=4, separator=', '))
-        text.append("")
-        text.append("Rodrigues rvec:")
-        text.append(np.array2string(rvec0.ravel(), precision=4, separator=', '))
-        dlg = QtWidgets.QMessageBox(self)
-        dlg.setWindowTitle("Calibration Results")
-        dlg.setText('\n'.join(text))
-        dlg.exec_()
 
     def _stop_bg_sender(self):
         if self._bg_sender is not None:
@@ -257,100 +388,11 @@ class MainWindow(QtWidgets.QWidget):
                 pass
             self._bg_sender = None
 
-    def _on_calib_finished(self, result):
-        # Clean up thread + progress dialog
-        try:
-            if self._progress_dialog is not None:
-                self._progress_dialog.close()
-                self._progress_dialog = None
-        except Exception:
-            pass
-
-        # result is dict {'K','poses','pts','res'}
-        K_opt = result['K']
-        poses_opt = result['poses']
-        # Save intrinsics to JSON and update internal state
-        out = {
-            "camera_matrix": {
-                "rows": 3,
-                "cols": 3,
-                "data": K_opt.reshape(-1).tolist()
-            }
-        }
-        out_path = "intrinsics_calibrated.json"
-        with open(out_path, "w") as f:
-            json.dump(out, f, indent=2)
-        self.intrinsics = out
-        self.log_msg(f"Calibration successful. Saved intrinsics to {out_path}")
-
-        # show results
-        if len(poses_opt) > 0:
-            pose0 = poses_opt[0]
-            self._show_calib_results(K_opt, pose0)
-
-        # send STYPE packet if enabled (reuse previous logic)
-        ip = self.ipEdit.text().strip()
-        try:
-            port = int(self.portEdit.text().strip())
-        except Exception:
-            port = 5005
-        do_bcast = self.broadcastCheck.isChecked()
-        continuous = self.continuousCheck.isChecked()
-        rate = float(self.rateSpin.value())
-
-        # stop any previous continuous sender
-        self._stop_bg_sender()
-
-        if do_bcast and len(poses_opt) > 0:
-            R0, t0 = poses_opt[0]
-            rvec0, _ = cv2.Rodrigues(R0)
-            image_size = (self.videoLabel.pixmap().height(), self.videoLabel.pixmap().width()) if self.videoLabel.pixmap() is not None else (720, 1280)
-            fx = K_opt[0, 0]
-            fy = K_opt[1, 1]
-            cx = K_opt[0, 2]
-            cy = K_opt[1, 2]
-            K_tuple = (fx, fy, cx, cy)
-            packet = send_camera_stype(ip=ip, port=port, packet_no=self.packet_no,
-                                       position=(float(t0[0]), float(t0[1]), float(t0[2])),
-                                       rvec=rvec0.ravel(),
-                                       image_size=image_size,
-                                       K=K_tuple,
-                                       broadcast=self.broadcastCheck.isChecked())
-            self.log_msg(f"Sent STYPE packet to {ip}:{port} (packet_no={self.packet_no})")
-            self.packet_no = (self.packet_no + 1) & 0xFF
-
-            if continuous:
-                bg = BackgroundSender(ip=ip, port=port, packet=packet, rate_hz=rate, broadcast=self.broadcastCheck.isChecked())
-                bg.start()
-                self._bg_sender = bg
-                self.log_msg(f"Started continuous STYPE broadcast at {rate} Hz")
-
-        # thread cleanup
-        if self._calib_thread is not None:
-            self._calib_thread.quit()
-            self._calib_thread.wait()
-            self._calib_thread = None
-            self._calib_worker = None
-
-    def _on_calib_error(self, msg):
-        try:
-            if self._progress_dialog is not None:
-                self._progress_dialog.close()
-                self._progress_dialog = None
-        except Exception:
-            pass
-        self.log_msg(f"Calibration failed: {msg}")
-        QtWidgets.QMessageBox.critical(self, "Calibration Failed",
-                                       "Markerless calibration failed. Try capturing frames with more parallax and texture, or use a checkerboard/marker fallback.")
-        if self._calib_thread is not None:
-            self._calib_thread.quit()
-            self._calib_thread.wait()
-            self._calib_thread = None
-            self._calib_worker = None
-
     def run_markerless_calib(self):
-        n_frames, ok = QtWidgets.QInputDialog.getInt(self, "Frames", "Number of frames to capture (>=3):", 8, 3, 50, 1)
-        if not ok:
+        n_frames = simpledialog.askinteger(
+            "Frames", "Number of frames to capture (>=3):", initialvalue=8, minvalue=3, maxvalue=50
+        )
+        if n_frames is None:
             return
 
         frames = []
@@ -370,12 +412,12 @@ class MainWindow(QtWidgets.QWidget):
                 frames.append(frame.copy())
             cap.release()
         else:
-            cam_id, okc = QtWidgets.QInputDialog.getInt(self, "Camera", "Camera index:", 0, 0, 10, 1)
-            if not okc:
+            cam_id = simpledialog.askinteger("Camera", "Camera index:", initialvalue=0, minvalue=0, maxvalue=10)
+            if cam_id is None:
                 return
             cap = cv2.VideoCapture(cam_id)
             if not cap.isOpened():
-                QtWidgets.QMessageBox.critical(self, "Camera Error", f"Cannot open camera {cam_id}")
+                messagebox.showerror("Camera Error", f"Cannot open camera {cam_id}")
                 return
             self.log_msg("Press SPACE to capture a frame, ESC to cancel.")
             while len(frames) < n_frames:
@@ -383,8 +425,15 @@ class MainWindow(QtWidgets.QWidget):
                 if not ret:
                     break
                 disp = frame.copy()
-                cv2.putText(disp, f"Frame {len(frames)}/{n_frames}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(
+                    disp,
+                    f"Frame {len(frames)}/{n_frames}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 0),
+                    2,
+                )
                 cv2.imshow("Capture (press SPACE)", disp)
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27:
@@ -397,30 +446,27 @@ class MainWindow(QtWidgets.QWidget):
             cv2.destroyAllWindows()
 
         if len(frames) < 3:
-            QtWidgets.QMessageBox.warning(self, "Not enough frames", "Captured fewer than 3 frames. Aborting calibration.")
+            messagebox.showwarning("Not enough frames", "Captured fewer than 3 frames. Aborting calibration.")
             return
 
-        # run calibration (this may take time)
         self.log_msg("Running markerless bundle-adjustment autocalibration (this may take a while)...")
         try:
-            # initial K guess from frame size
             h, w = frames[0].shape[:2]
             K0 = default_initial_K((h, w))
-            K_opt, poses_opt, pts_opt, res = run_markerless_from_frames(frames, initial_K=K0, fxfy_equal=True, verbose=2)
+            K_opt, poses_opt, pts_opt, res = run_markerless_from_frames(
+                frames, initial_K=K0, fxfy_equal=True, verbose=2
+            )
         except Exception as e:
             self.log_msg(f"Calibration failed: {e}")
-            QtWidgets.QMessageBox.critical(self, "Calibration Failed",
-                                           "Markerless calibration failed. Try capturing frames with more parallax and texture, or use a checkerboard/marker fallback.")
+            messagebox.showerror(
+                "Calibration Failed",
+                "Markerless calibration failed. Try capturing frames with more parallax and texture, or use a checkerboard/marker fallback.",
+            )
             return
 
-        # Save intrinsics to JSON and update internal state
         K_list = K_opt.reshape(-1).tolist()
         out = {
-            "camera_matrix": {
-                "rows": 3,
-                "cols": 3,
-                "data": K_list
-            },
+            "camera_matrix": {"rows": 3, "cols": 3, "data": K_list},
             "fx": float(K_opt[0, 0]),
             "fy": float(K_opt[1, 1]),
             "cx": float(K_opt[0, 2]),
@@ -429,13 +475,49 @@ class MainWindow(QtWidgets.QWidget):
             "k2": 0.0,
             "p1": 0.0,
             "p2": 0.0,
-            "k3": 0.0
+            "k3": 0.0,
         }
         out_path = "intrinsics_calibrated.json"
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
-        self.intrinsics = normalize_intrinsics(out)  # update in-memory intrinsics used by pipeline
+        self.intrinsics = normalize_intrinsics(out)
         self.log_msg(f"Calibration successful. Saved intrinsics to {out_path}")
+
+        if self.broadcast_var.get() and len(poses_opt) > 0:
+            self._stop_bg_sender()
+            R0, t0 = poses_opt[0]
+            rvec0, _ = cv2.Rodrigues(R0)
+            image_size = (w, h)
+            fx = K_opt[0, 0]
+            fy = K_opt[1, 1]
+            cx = K_opt[0, 2]
+            cy = K_opt[1, 2]
+            K_tuple = (fx, fy, cx, cy)
+            try:
+                packet = send_camera_stype(
+                    ip=self.udp_ip,
+                    port=self.udp_port,
+                    packet_no=self.packet_no,
+                    position=(float(t0[0]), float(t0[1]), float(t0[2])),
+                    rvec=rvec0.ravel(),
+                    image_size=image_size,
+                    K=K_tuple,
+                    broadcast=self.broadcast_var.get(),
+                )
+                self.log_msg(f"Sent STYPE packet to {self.udp_ip}:{self.udp_port} (packet_no={self.packet_no})")
+                self.packet_no = (self.packet_no + 1) & 0xFF
+                if self.continuous_var.get():
+                    self._bg_sender = BackgroundSender(
+                        ip=self.udp_ip,
+                        port=self.udp_port,
+                        packet=packet,
+                        rate_hz=float(self.rate_var.get()),
+                        broadcast=self.broadcast_var.get(),
+                    )
+                    self._bg_sender.start()
+                    self.log_msg(f"Started continuous STYPE broadcast at {self.rate_var.get()} Hz")
+            except Exception as e:
+                self.log_msg(f"Failed to send STYPE packet: {e}")
 
     def run_pipeline(self):
         if not self.videoPath:
@@ -452,16 +534,14 @@ class MainWindow(QtWidgets.QWidget):
             self.log_msg(f"Invalid intrinsics: {e}")
             return
 
-        self.log_msg(f"Using UDP settings: {self.udp_ip}:{self.udp_port}")
-
         cap = cv2.VideoCapture(self.videoPath)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         frame_idx = 0
 
         undistorter = Undistorter(intr)
-        use_torch_guess = torch_installed_on_path()
-        segmenter = FieldSegmenter(device="cpu", use_torch=use_torch_guess)
-
+        segmentation_device = "cuda" if torch_is_available() else "cpu"
+        self.log_msg(f"Segmentation using device: {segmentation_device}")
+        segmenter = FieldSegmenter(device=segmentation_device, use_torch=torch_installed_on_path())
         pitcher = PitchExtractor()
         vo = MonoVO(intr)
         imu = IMUFuser(self.imuPath) if self.imuPath else IMUFuser(None)
@@ -485,19 +565,29 @@ class MainWindow(QtWidgets.QWidget):
             smooth_pose = smoother.update(world_pose, timestamp)
             ar_img = ar.render_overlay(und, smooth_pose, mask, pitch_lines)
 
-            # display
-            draw = cv2.cvtColor(ar_img, cv2.COLOR_BGR2RGB)
-            h, w, ch = draw.shape
-            qimg = QtGui.QImage(draw.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
-            pix = QtGui.QPixmap.fromImage(qimg).scaled(self.videoLabel.size(), QtCore.Qt.KeepAspectRatio)
-            self.videoLabel.setPixmap(pix)
-            QtWidgets.QApplication.processEvents()
-
+            self._show_frame(ar_img)
+            self.root.update()
             frame_idx += 1
 
         ar.close()
         cap.release()
         self.log_msg("Processing finished. Outputs saved to output/")
+
+    def _show_frame(self, frame):
+        if frame is None:
+            return
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        try:
+            _, buffer = cv2.imencode(".png", rgb_frame)
+            data = base64.b64encode(buffer).decode("ascii")
+            self.photo = tk.PhotoImage(data=data, format="png")
+        except Exception:
+            _, buffer = cv2.imencode(".ppm", rgb_frame)
+            self.photo = tk.PhotoImage(data=buffer.tobytes())
+
+        self.video_label.configure(image=self.photo)
+        self.video_label.image = self.photo
 
 
 def torch_is_available():
@@ -511,8 +601,9 @@ def torch_is_available():
 def torch_installed_on_path():
     return importlib.util.find_spec("torch") is not None
 
+
 if __name__ == "__main__":
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+    root = tk.Tk()
+    root.state("zoomed")
+    MainWindow(root)
+    root.mainloop()
