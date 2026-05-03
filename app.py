@@ -29,6 +29,58 @@ from pipeline.ba_autocalib import run_markerless_from_frames, default_initial_K 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+SETTINGS_PATH = Path("app_settings.json")
+DEFAULT_SETTINGS = {
+    "udp_ip": "127.0.0.1",
+    "udp_port": 5555
+}
+
+
+def normalize_intrinsics(intrinsics):
+    """Normalize supported intrinsics JSON formats to a canonical dict.
+
+    Supported input formats:
+      - {"fx", "fy", "cx", "cy", ...}
+      - {"camera_matrix": {"rows": 3, "cols": 3, "data": [..]}}
+      - {"camera_matrix": [[..],[..],[..]]}
+      - {"camera_matrix": [9 values]}
+    """
+    if intrinsics is None:
+        return None
+
+    intr = dict(intrinsics)
+
+    def _read_camera_matrix(cm):
+        if isinstance(cm, dict):
+            data = cm.get("data")
+            if data is None:
+                data = cm.get("matrix")
+            if data is None and cm.get("rows") == 3 and cm.get("cols") == 3:
+                # Support OpenCV-style nested camera_matrix dict
+                data = cm.get("data")
+        else:
+            data = cm
+
+        if isinstance(data, (list, tuple)) and len(data) == 9:
+            return np.array(data, dtype=float).reshape((3, 3))
+        if isinstance(data, (list, tuple)) and len(data) == 3 and all(isinstance(row, (list, tuple)) and len(row) == 3 for row in data):
+            return np.array(data, dtype=float)
+        return None
+
+    if "camera_matrix" in intr:
+        K = _read_camera_matrix(intr["camera_matrix"])
+        if K is not None:
+            intr["fx"] = float(K[0, 0])
+            intr["fy"] = float(K[1, 1])
+            intr["cx"] = float(K[0, 2])
+            intr["cy"] = float(K[1, 2])
+
+    if {"fx", "fy", "cx", "cy"}.issubset(intr):
+        return intr
+
+    raise ValueError("Unsupported intrinsics JSON format: expected fx/fy/cx/cy or camera_matrix data.")
+
+
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -70,6 +122,24 @@ class MainWindow(QtWidgets.QWidget):
         self.calibBtn.clicked.connect(self.run_markerless_calib)  # NEW handler
         self.runBtn.clicked.connect(self.run_pipeline)
 
+        self.udpIpEdit = QtWidgets.QLineEdit()
+        self.udpIpEdit.setFixedWidth(140)
+        self.udpPortEdit = QtWidgets.QLineEdit()
+        self.udpPortEdit.setFixedWidth(80)
+        self.udpPortEdit.setValidator(QtGui.QIntValidator(1, 65535, self))
+
+        udp_layout = QtWidgets.QHBoxLayout()
+        udp_layout.addWidget(QtWidgets.QLabel("UDP IP:"))
+        udp_layout.addWidget(self.udpIpEdit)
+        udp_layout.addWidget(QtWidgets.QLabel("Port:"))
+        udp_layout.addWidget(self.udpPortEdit)
+        self.saveUdpBtn = QtWidgets.QPushButton("Save UDP Settings")
+        udp_layout.addWidget(self.saveUdpBtn)
+        layout.addLayout(udp_layout)
+
+        self.saveUdpBtn.clicked.connect(self.save_settings)
+        self.load_settings()
+
     def log_msg(self, s):
         ts = time.strftime("%H:%M:%S")
         self.log.append(f"[{ts}] {s}")
@@ -81,11 +151,51 @@ class MainWindow(QtWidgets.QWidget):
             self.videoPath = path
             self.log_msg(f"Loaded video: {path}")
 
+    def load_settings(self):
+        self.udp_ip = DEFAULT_SETTINGS["udp_ip"]
+        self.udp_port = DEFAULT_SETTINGS["udp_port"]
+        if SETTINGS_PATH.exists():
+            try:
+                with open(SETTINGS_PATH, "r") as f:
+                    data = json.load(f)
+                self.udp_ip = data.get("udp_ip", self.udp_ip)
+                self.udp_port = int(data.get("udp_port", self.udp_port))
+            except Exception as e:
+                self.log_msg(f"Failed to load settings: {e}")
+        self.udpIpEdit.setText(str(self.udp_ip))
+        self.udpPortEdit.setText(str(self.udp_port))
+        self.log_msg(f"Loaded UDP settings: {self.udp_ip}:{self.udp_port}")
+
+    def save_settings(self):
+        ip = self.udpIpEdit.text().strip() or DEFAULT_SETTINGS["udp_ip"]
+        port_text = self.udpPortEdit.text().strip()
+        try:
+            port = int(port_text)
+            if port < 1 or port > 65535:
+                raise ValueError("Port out of range")
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, "Invalid Port", "Port must be an integer between 1 and 65535.")
+            return
+        self.udp_ip = ip
+        self.udp_port = port
+        settings = {"udp_ip": self.udp_ip, "udp_port": self.udp_port}
+        try:
+            with open(SETTINGS_PATH, "w") as f:
+                json.dump(settings, f, indent=2)
+            self.log_msg(f"Saved UDP settings: {self.udp_ip}:{self.udp_port}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save Failed", f"Unable to save settings: {e}")
+
     def load_intrinsics(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open intrinsics JSON", ".", "JSON (*.json)")
         if path:
             with open(path, "r") as f:
-                self.intrinsics = json.load(f)
+                raw = json.load(f)
+            try:
+                self.intrinsics = normalize_intrinsics(raw)
+            except ValueError as e:
+                QtWidgets.QMessageBox.critical(self, "Invalid Intrinsics", str(e))
+                return
             self.log_msg(f"Loaded intrinsics: {path}")
 
     def load_imu(self):
@@ -169,17 +279,27 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         # Save intrinsics to JSON and update internal state
+        K_list = K_opt.reshape(-1).tolist()
         out = {
             "camera_matrix": {
                 "rows": 3,
                 "cols": 3,
-                "data": K_opt.reshape(-1).tolist()
-            }
+                "data": K_list
+            },
+            "fx": float(K_opt[0, 0]),
+            "fy": float(K_opt[1, 1]),
+            "cx": float(K_opt[0, 2]),
+            "cy": float(K_opt[1, 2]),
+            "k1": 0.0,
+            "k2": 0.0,
+            "p1": 0.0,
+            "p2": 0.0,
+            "k3": 0.0
         }
         out_path = "intrinsics_calibrated.json"
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
-        self.intrinsics = out  # update in-memory intrinsics used by pipeline
+        self.intrinsics = normalize_intrinsics(out)  # update in-memory intrinsics used by pipeline
         self.log_msg(f"Calibration successful. Saved intrinsics to {out_path}")
 
     def run_pipeline(self):
@@ -191,21 +311,29 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         self.log_msg("Starting pipeline...")
+        try:
+            intr = normalize_intrinsics(self.intrinsics)
+        except ValueError as e:
+            self.log_msg(f"Invalid intrinsics: {e}")
+            return
+
+        self.log_msg(f"Using UDP settings: {self.udp_ip}:{self.udp_port}")
+
         cap = cv2.VideoCapture(self.videoPath)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         frame_idx = 0
 
-        undistorter = Undistorter(self.intrinsics)
+        undistorter = Undistorter(intr)
         use_torch_guess = torch_installed_on_path()
         segmenter = FieldSegmenter(device="cpu", use_torch=use_torch_guess)
         # segmenter = FieldSegmenter(device="cuda" if torch_is_available() else "cpu")
 
         pitcher = PitchExtractor()
-        vo = MonoVO(self.intrinsics)
+        vo = MonoVO(intr)
         imu = IMUFuser(self.imuPath) if self.imuPath else IMUFuser(None)
-        aligner = GroundAligner(self.intrinsics)
+        aligner = GroundAligner(intr)
         smoother = PoseKalman()
-        ar = AROutput(self.intrinsics, OUTPUT_DIR / "poses.csv")
+        ar = AROutput(intr, OUTPUT_DIR / "poses.csv")
 
         self.log_msg("Pipeline modules created. Processing frames...")
 
