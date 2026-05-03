@@ -98,6 +98,8 @@ class MainWindow:
         self.root.minsize(1100, 700)
 
         self.videoPath = None
+        self.video_source_type = None
+        self.video_camera_index = None
         self.intrinsics = None
         self.imuPath = None
         self.udp_ip = DEFAULT_SETTINGS["udp_ip"]
@@ -281,7 +283,6 @@ class MainWindow:
             relief="flat",
         )
 
-
     def log_msg(self, message):
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {message}\n"
@@ -313,13 +314,61 @@ class MainWindow:
             self.toggle_panel_btn.config(text="Show Panel")
 
     def load_video(self):
-        path = filedialog.askopenfilename(
-            title="Open video",
-            filetypes=[("Video files", "*.mp4 *.avi *.mov"), ("All files", "*")],
-        )
-        if path:
+        if messagebox.askyesno(
+            "Video Source",
+            "Use a live camera stream?\n\nYes = live camera\nNo = recorded video file",
+        ):
+            cam_id = simpledialog.askinteger(
+                "Camera", "Camera index:", initialvalue=0, minvalue=0, maxvalue=10
+            )
+            if cam_id is None:
+                return
+            self.video_source_type = "camera"
+            self.video_camera_index = int(cam_id)
+            self.videoPath = None
+            self.log_msg(f"Selected live camera stream: index {self.video_camera_index}")
+        else:
+            path = filedialog.askopenfilename(
+                title="Open video",
+                filetypes=[("Video files", "*.mp4 *.avi *.mov"), ("All files", "*")],
+            )
+            if not path:
+                return
+            self.video_source_type = "file"
             self.videoPath = path
+            self.video_camera_index = None
             self.log_msg(f"Loaded video: {path}")
+
+    def _open_video_capture(self):
+        if self.video_source_type == "camera":
+            cam_idx = self.video_camera_index if self.video_camera_index is not None else 0
+            gst_pipeline = (
+                f"ksvideosrc device-index={cam_idx} ! videoconvert ! appsink"
+            )
+            self.log_msg(f"Trying GStreamer camera pipeline: {gst_pipeline}")
+            cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                self.log_msg("GStreamer camera open failed; falling back to default OpenCV capture.")
+                cap = cv2.VideoCapture(cam_idx)
+            if not cap.isOpened():
+                messagebox.showerror("Camera Error", f"Cannot open camera {cam_idx}")
+                return None
+            self.log_msg(f"Opened camera stream {cam_idx}")
+            return cap
+
+        if self.video_source_type == "file" and self.videoPath:
+            cap = cv2.VideoCapture(self.videoPath)
+            if not cap.isOpened():
+                messagebox.showerror("Video Error", f"Cannot open video file {self.videoPath}")
+                return None
+            self.log_msg(f"Opened video file: {self.videoPath}")
+            return cap
+
+        messagebox.showwarning(
+            "Video Source",
+            "Please select a recorded video or live camera stream using Load Video first.",
+        )
+        return None
 
     def load_settings(self):
         self.udp_ip = DEFAULT_SETTINGS["udp_ip"]
@@ -396,8 +445,11 @@ class MainWindow:
             return
 
         frames = []
-        if self.videoPath:
-            cap = cv2.VideoCapture(self.videoPath)
+        cap = self._open_video_capture()
+        if cap is None:
+            return
+
+        if self.video_source_type == "file":
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             if total < n_frames:
                 self.log_msg(f"Video has only {total} frames; reducing requested frames.")
@@ -412,13 +464,6 @@ class MainWindow:
                 frames.append(frame.copy())
             cap.release()
         else:
-            cam_id = simpledialog.askinteger("Camera", "Camera index:", initialvalue=0, minvalue=0, maxvalue=10)
-            if cam_id is None:
-                return
-            cap = cv2.VideoCapture(cam_id)
-            if not cap.isOpened():
-                messagebox.showerror("Camera Error", f"Cannot open camera {cam_id}")
-                return
             self.log_msg("Press SPACE to capture a frame, ESC to cancel.")
             while len(frames) < n_frames:
                 ret, frame = cap.read()
@@ -520,8 +565,8 @@ class MainWindow:
                 self.log_msg(f"Failed to send STYPE packet: {e}")
 
     def run_pipeline(self):
-        if not self.videoPath:
-            self.log_msg("No video selected.")
+        if self.video_source_type is None:
+            self.log_msg("No video source selected. Use Load Video first.")
             return
         if not self.intrinsics:
             self.log_msg("No intrinsics JSON selected.")
@@ -534,7 +579,9 @@ class MainWindow:
             self.log_msg(f"Invalid intrinsics: {e}")
             return
 
-        cap = cv2.VideoCapture(self.videoPath)
+        cap = self._open_video_capture()
+        if cap is None:
+            return
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         frame_idx = 0
 
